@@ -1,6 +1,5 @@
-use csv_preview::{CsvPreviewView, TabularDataPreviewFeatureFlag};
+use csv_preview::CsvPreviewView;
 use editor::{Editor, MultiBuffer};
-use feature_flags::FeatureFlagAppExt as _;
 use gpui::{AnyElement, Entity, Modifiers};
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use svg_preview::svg_preview_view::SvgPreviewView;
@@ -31,7 +30,6 @@ impl QuickActionBar {
         {
             PreviewTarget::Svg(buffer)
         } else if let Some(editor) = editor
-            && cx.has_flag::<TabularDataPreviewFeatureFlag>()
             && CsvPreviewView::is_csv_file(&editor, cx)
         {
             PreviewTarget::Csv(editor)
