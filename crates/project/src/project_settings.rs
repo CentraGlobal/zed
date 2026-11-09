@@ -843,6 +843,12 @@ pub struct SettingsObserver {
 impl SettingsObserver {
     pub fn init(client: &AnyProtoClient) {
         client.add_entity_message_handler(Self::handle_update_worktree_settings);
+    }
+
+    /// User settings only flow from the client to the headless server. The client must never
+    /// let its peer replace its user settings, since those can spawn local processes.
+    pub fn init_headless(client: &AnyProtoClient) {
+        Self::init(client);
         client.add_entity_message_handler(Self::handle_update_user_settings);
     }
 
