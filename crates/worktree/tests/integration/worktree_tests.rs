@@ -1,3 +1,4 @@
+mod symlink_escape;
 mod worktree_settings_tests;
 
 use anyhow::Result;

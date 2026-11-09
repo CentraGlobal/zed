@@ -22855,6 +22855,8 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "async-lock",
+ "async-tar",
+ "async-trait",
  "clock",
  "collections",
  "encoding_rs",

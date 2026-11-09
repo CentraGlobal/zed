@@ -60,6 +60,8 @@ util.workspace = true
 ztracing.workspace = true
 
 [dev-dependencies]
+async-tar.workspace = true
+async-trait.workspace = true
 clock = { workspace = true, features = ["test-support"] }
 collections = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
