@@ -63,11 +63,12 @@ use project::{
     git_store::{GitStoreEvent, Repository, RepositoryEvent, StatusEntry, pending_op},
     search::{SearchQuery, SearchResult},
     task_store::{TaskSettingsLocation, TaskStore},
+    trusted_worktrees::{PathTrust, TrustedWorktrees},
     *,
 };
 use rand::{Rng as _, rngs::StdRng};
 use serde_json::json;
-use settings::{GlobalLspSettingsContent, SettingsStore, SplicingVec};
+use settings::{GlobalLspSettingsContent, Settings, SettingsStore, SplicingVec};
 #[cfg(target_os = "linux")]
 use settings::{LocalSettingsKind, LocalSettingsPath};
 #[cfg(not(windows))]
@@ -86,7 +87,11 @@ use std::{
     time::Duration,
 };
 use sum_tree::SumTree;
-use task::{ResolvedTask, ShellKind, TaskContext};
+use task::{
+    BuildTaskDefinition, DebugScenario, ResolvedTask, ShellBuilder, ShellKind, SpawnInTerminal,
+    TaskContext, TaskId,
+};
+use terminal::{HeadlessTerminal, terminal_settings::TerminalSettings};
 use text::{Anchor, PointUtf16, ReplicaId, ToOffset, Unclipped};
 use unindent::Unindent as _;
 use util::{
@@ -1202,6 +1207,662 @@ async fn test_managing_project_specific_settings(cx: &mut gpui::TestAppContext) 
             ),
         ]
     );
+}
+
+/// Restricted worktrees must not register or run project tasks and debug
+/// scenarios. The task picker wraps a task in the system shell and
+/// `Project::create_terminal_task` runs that program. A debug scenario's build
+/// task takes the same terminal path, and a `node-terminal` command is split
+/// into a program plus arguments and spawned the same way the JavaScript
+/// adapter's `runInTerminal` request is.
+#[gpui::test]
+async fn test_untrusted_worktree_does_not_run_tasks_or_debug_scenarios(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_untrusted_command_test(cx);
+
+    let markers = CommandMarkers::new("withheld");
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/zed_project"),
+        json!({
+            ".zed": {
+                "settings.json": r#"{ "tab_size": 13 }"#,
+                "tasks.json": serde_json::to_string(&json!([
+                    {
+                        "label": "Run tests",
+                        "command": format!("touch {} && true", markers.zed_task.display()),
+                    },
+                    {
+                        "label": "Package",
+                        "command": format!("touch {} && true", markers.by_name.display()),
+                    },
+                ])).unwrap(),
+                "debug.json": serde_json::to_string(&json!([
+                    {
+                        "label": "Debug build",
+                        "adapter": "JavaScript",
+                        "build": {
+                            "command": "touch",
+                            "args": [markers.debug_build],
+                        },
+                    },
+                    {
+                        "label": "Debug package",
+                        "adapter": "JavaScript",
+                        "build": "Package",
+                    },
+                    {
+                        "label": "Debug terminal",
+                        "adapter": "JavaScript",
+                        "request": "launch",
+                        "type": "node-terminal",
+                        "command": format!("/bin/sh -c 'touch {}'", markers.zed_node.display()),
+                    },
+                ])).unwrap(),
+            },
+            "b": {
+                ".zed": {
+                    "tasks.json": serde_json::to_string(&json!([{
+                        "label": "Nested check",
+                        "command": format!("touch {} && true", markers.nested_task.display()),
+                    }])).unwrap(),
+                },
+                "b.rs": "fn b() {}",
+            },
+            "main.rs": "fn main() {}",
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/vscode_project"),
+        json!({
+            ".vscode": {
+                "tasks.json": serde_json::to_string(&json!({
+                    "version": "2.0.0",
+                    "tasks": [{
+                        "label": "Build project",
+                        "type": "shell",
+                        "command": format!("touch {} && true", markers.vscode_task.display()),
+                    }],
+                })).unwrap(),
+                "launch.json": serde_json::to_string(&json!({
+                    "version": "0.2.0",
+                    "configurations": [{
+                        "name": "Run app",
+                        "type": "node-terminal",
+                        "request": "launch",
+                        "command": format!("/bin/sh -c 'touch {}'", markers.vscode_launch.display()),
+                    }],
+                })).unwrap(),
+            },
+            "app.js": "console.log(1)\n",
+        }),
+    )
+    .await;
+
+    let project = Project::test_with_worktree_trust(
+        fs,
+        [path!("/zed_project").as_ref(), path!("/vscode_project").as_ref()],
+        cx,
+    )
+    .await;
+    cx.executor().run_until_parked();
+
+    let zed_id = worktree_id_for_abs_path(&project, path!("/zed_project").as_ref(), cx);
+    let vscode_id = worktree_id_for_abs_path(&project, path!("/vscode_project").as_ref(), cx);
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let trusted = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    let zed_trusted = trusted.update(cx, |store, cx| store.can_trust(&worktree_store, zed_id, cx));
+    let vscode_trusted =
+        trusted.update(cx, |store, cx| store.can_trust(&worktree_store, vscode_id, cx));
+    assert!(!zed_trusted, "zed project should be restricted");
+    assert!(!vscode_trusted, "vscode project should be restricted");
+    assert_ne!(
+        tab_size_for_worktree(&project, zed_id, rel_path("main.rs"), cx).await,
+        13,
+        "local settings apply only after the worktree is trusted"
+    );
+    assert!(
+        markers.created().is_empty(),
+        "reading task and debug files must not run their commands: {:?}",
+        markers.created()
+    );
+
+    let zed_ran = exercise_worktree_commands(&project, zed_id, cx).await;
+    let vscode_ran = exercise_worktree_commands(&project, vscode_id, cx).await;
+    assert!(
+        zed_ran.task_labels.is_empty()
+            && zed_ran.scenario_labels.is_empty()
+            && vscode_ran.task_labels.is_empty()
+            && vscode_ran.scenario_labels.is_empty()
+            && markers.created().is_empty()
+            && zed_ran.spawn_errors.is_empty()
+            && vscode_ran.spawn_errors.is_empty(),
+        "restricted worktrees loaded or ran project commands\n\
+         zed tasks: {:?}\n\
+         zed scenarios: {:?}\n\
+         vscode tasks: {:?}\n\
+         vscode scenarios: {:?}\n\
+         markers: {:?}\n\
+         zed spawn errors: {:?}\n\
+         vscode spawn errors: {:?}",
+        zed_ran.task_labels,
+        zed_ran.scenario_labels,
+        vscode_ran.task_labels,
+        vscode_ran.scenario_labels,
+        markers.created(),
+        zed_ran.spawn_errors,
+        vscode_ran.spawn_errors,
+    );
+
+    trusted.update(cx, |store, cx| {
+        store.trust(
+            &worktree_store,
+            HashSet::from_iter([PathTrust::Worktree(zed_id)]),
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        tab_size_for_worktree(&project, zed_id, rel_path("main.rs"), cx).await,
+        13,
+        "trusting the zed worktree applies its pending settings"
+    );
+    let zed_ran = exercise_worktree_commands(&project, zed_id, cx).await;
+    let vscode_ran = exercise_worktree_commands(&project, vscode_id, cx).await;
+    assert_eq!(
+        zed_ran.task_labels,
+        vec![
+            "Nested check".to_string(),
+            "Package".to_string(),
+            "Run tests".to_string(),
+        ],
+    );
+    assert_eq!(
+        zed_ran.scenario_labels,
+        vec![
+            "Debug build".to_string(),
+            "Debug package".to_string(),
+            "Debug terminal".to_string(),
+        ],
+    );
+    assert!(
+        zed_ran.spawn_errors.is_empty(),
+        "trusted zed commands failed to spawn: {:?}",
+        zed_ran.spawn_errors
+    );
+    assert_eq!(
+        markers.created(),
+        vec![
+            markers.by_name.clone(),
+            markers.debug_build.clone(),
+            markers.nested_task.clone(),
+            markers.zed_node.clone(),
+            markers.zed_task.clone(),
+        ],
+        "trusting a worktree runs the commands that were held for that worktree"
+    );
+    assert!(
+        vscode_ran.task_labels.is_empty() && vscode_ran.scenario_labels.is_empty(),
+        "trusting one worktree must not release another's tasks or debug scenarios: {vscode_ran:?}"
+    );
+    assert!(
+        !markers.vscode_task.exists() && !markers.vscode_launch.exists(),
+        "the still-restricted vscode project must not run"
+    );
+
+    trusted.update(cx, |store, cx| {
+        store.trust(
+            &worktree_store,
+            HashSet::from_iter([PathTrust::Worktree(vscode_id)]),
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+    let vscode_ran = exercise_worktree_commands(&project, vscode_id, cx).await;
+    assert_eq!(vscode_ran.task_labels, vec!["Build project".to_string()]);
+    assert_eq!(vscode_ran.scenario_labels, vec!["Run app".to_string()]);
+    assert!(
+        vscode_ran.spawn_errors.is_empty(),
+        "trusted vscode commands failed to spawn: {:?}",
+        vscode_ran.spawn_errors
+    );
+    assert!(markers.vscode_task.exists());
+    assert!(markers.vscode_launch.exists());
+}
+
+#[gpui::test]
+async fn test_tasks_added_to_untrusted_worktree_stay_pending(cx: &mut gpui::TestAppContext) {
+    init_untrusted_command_test(cx);
+
+    let markers = CommandMarkers::new("added-later");
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/zed_project"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    fs.insert_tree(path!("/vscode_project"), json!({ "app.js": "" }))
+        .await;
+
+    let project = Project::test_with_worktree_trust(
+        fs.clone(),
+        [path!("/zed_project").as_ref(), path!("/vscode_project").as_ref()],
+        cx,
+    )
+    .await;
+    cx.executor().run_until_parked();
+    let zed_id = worktree_id_for_abs_path(&project, path!("/zed_project").as_ref(), cx);
+    let vscode_id = worktree_id_for_abs_path(&project, path!("/vscode_project").as_ref(), cx);
+
+    fs.save(
+        path!("/zed_project/.zed/tasks.json").as_ref(),
+        &serde_json::to_string(&json!([{
+            "label": "Run tests",
+            "command": format!("touch {} && true", markers.zed_task.display()),
+        }]))
+        .unwrap()
+        .into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    fs.save(
+        path!("/zed_project/.zed/debug.json").as_ref(),
+        &serde_json::to_string(&json!([{
+            "label": "Debug terminal",
+            "adapter": "JavaScript",
+            "request": "launch",
+            "type": "node-terminal",
+            "command": format!("/bin/sh -c 'touch {}'", markers.zed_node.display()),
+        }]))
+        .unwrap()
+        .into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    fs.save(
+        path!("/vscode_project/.vscode/tasks.json").as_ref(),
+        &serde_json::to_string(&json!({
+            "version": "2.0.0",
+            "tasks": [{
+                "label": "Build project",
+                "type": "shell",
+                "command": format!("touch {} && true", markers.vscode_task.display()),
+            }],
+        }))
+        .unwrap()
+        .into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    fs.save(
+        path!("/vscode_project/.vscode/launch.json").as_ref(),
+        &serde_json::to_string(&json!({
+            "version": "0.2.0",
+            "configurations": [{
+                "name": "Run app",
+                "type": "node-terminal",
+                "request": "launch",
+                "command": format!("/bin/sh -c 'touch {}'", markers.vscode_launch.display()),
+            }],
+        }))
+        .unwrap()
+        .into(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    cx.executor().run_until_parked();
+
+    let zed_ran = exercise_worktree_commands(&project, zed_id, cx).await;
+    let vscode_ran = exercise_worktree_commands(&project, vscode_id, cx).await;
+    assert!(
+        zed_ran.task_labels.is_empty()
+            && zed_ran.scenario_labels.is_empty()
+            && vscode_ran.task_labels.is_empty()
+            && vscode_ran.scenario_labels.is_empty()
+            && markers.created().is_empty()
+            && zed_ran.spawn_errors.is_empty()
+            && vscode_ran.spawn_errors.is_empty(),
+        "files added while a worktree is restricted were loaded or run\n\
+         zed tasks: {:?}\n zed scenarios: {:?}\n vscode tasks: {:?}\n vscode scenarios: {:?}\n\
+         markers: {:?}\n zed errors: {:?}\n vscode errors: {:?}",
+        zed_ran.task_labels,
+        zed_ran.scenario_labels,
+        vscode_ran.task_labels,
+        vscode_ran.scenario_labels,
+        markers.created(),
+        zed_ran.spawn_errors,
+        vscode_ran.spawn_errors,
+    );
+
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let trusted = cx.update(|cx| TrustedWorktrees::try_get_global(cx).unwrap());
+    trusted.update(cx, |store, cx| {
+        store.trust(
+            &worktree_store,
+            HashSet::from_iter([PathTrust::Worktree(zed_id), PathTrust::Worktree(vscode_id)]),
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+
+    let zed_ran = exercise_worktree_commands(&project, zed_id, cx).await;
+    let vscode_ran = exercise_worktree_commands(&project, vscode_id, cx).await;
+    assert_eq!(zed_ran.task_labels, vec!["Run tests".to_string()]);
+    assert_eq!(zed_ran.scenario_labels, vec!["Debug terminal".to_string()]);
+    assert_eq!(vscode_ran.task_labels, vec!["Build project".to_string()]);
+    assert_eq!(vscode_ran.scenario_labels, vec!["Run app".to_string()]);
+    assert!(
+        zed_ran.spawn_errors.is_empty() && vscode_ran.spawn_errors.is_empty(),
+        "commands held until trust failed to spawn: {:?} {:?}",
+        zed_ran.spawn_errors,
+        vscode_ran.spawn_errors
+    );
+    assert!(markers.zed_task.exists());
+    assert!(markers.zed_node.exists());
+    assert!(markers.vscode_task.exists());
+    assert!(markers.vscode_launch.exists());
+}
+
+fn init_untrusted_command_test(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        project::trusted_worktrees::init(HashMap::default(), cx);
+        TerminalSettings::register(cx);
+        cx.set_global(HeadlessTerminal(true));
+    });
+}
+
+struct CommandMarkers {
+    zed_task: PathBuf,
+    nested_task: PathBuf,
+    by_name: PathBuf,
+    debug_build: PathBuf,
+    zed_node: PathBuf,
+    vscode_task: PathBuf,
+    vscode_launch: PathBuf,
+}
+
+impl CommandMarkers {
+    fn new(name: &str) -> Self {
+        let directory = env::temp_dir().join(format!(
+            "zed-untrusted-commands-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        Self {
+            zed_task: directory.join("zed-task"),
+            nested_task: directory.join("nested-task"),
+            by_name: directory.join("by-name"),
+            debug_build: directory.join("debug-build"),
+            zed_node: directory.join("zed-node"),
+            vscode_task: directory.join("vscode-task"),
+            vscode_launch: directory.join("vscode-launch"),
+        }
+    }
+
+    fn created(&self) -> Vec<PathBuf> {
+        [
+            &self.zed_task,
+            &self.nested_task,
+            &self.by_name,
+            &self.debug_build,
+            &self.zed_node,
+            &self.vscode_task,
+            &self.vscode_launch,
+        ]
+        .into_iter()
+        .filter(|path| path.exists())
+        .cloned()
+        .collect()
+    }
+}
+
+#[derive(Debug)]
+struct ExercisedCommands {
+    task_labels: Vec<String>,
+    scenario_labels: Vec<String>,
+    spawn_errors: Vec<String>,
+}
+
+fn worktree_id_for_abs_path(
+    project: &Entity<Project>,
+    abs_path: &Path,
+    cx: &mut gpui::TestAppContext,
+) -> worktree::WorktreeId {
+    project.read_with(cx, |project, cx| {
+        project
+            .find_worktree(abs_path, cx)
+            .unwrap()
+            .0
+            .read(cx)
+            .id()
+    })
+}
+
+async fn tab_size_for_worktree(
+    project: &Entity<Project>,
+    worktree_id: worktree::WorktreeId,
+    path: &RelPath,
+    cx: &mut gpui::TestAppContext,
+) -> u32 {
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_buffer((worktree_id, path), cx)
+        })
+        .await
+        .unwrap();
+    cx.update(|cx| LanguageSettings::for_buffer(&buffer.read(cx), cx).tab_size.get())
+}
+
+async fn exercise_worktree_commands(
+    project: &Entity<Project>,
+    worktree_id: worktree::WorktreeId,
+    cx: &mut gpui::TestAppContext,
+) -> ExercisedCommands {
+    let contexts = Arc::new(TaskContexts {
+        active_worktree_context: Some((worktree_id, TaskContext::default())),
+        ..TaskContexts::default()
+    });
+    let mut tasks = cx
+        .update(|cx| get_all_tasks(project, contexts.clone(), cx))
+        .await;
+    tasks.retain(|(kind, _)| {
+        matches!(kind, TaskSourceKind::Worktree { id, .. } if *id == worktree_id)
+    });
+    tasks.sort_by(|(_, left), (_, right)| left.resolved_label.cmp(&right.resolved_label));
+
+    let mut scenarios = project
+        .update(cx, |project, cx| {
+            project.task_store().update(cx, |task_store, cx| {
+                task_store
+                    .task_inventory()
+                    .cloned()
+                    .unwrap()
+                    .update(cx, |inventory, cx| {
+                        inventory.list_debug_scenarios(
+                            &TaskContexts {
+                                active_worktree_context: Some((
+                                    worktree_id,
+                                    TaskContext::default(),
+                                )),
+                                ..TaskContexts::default()
+                            },
+                            Vec::new(),
+                            Vec::new(),
+                            false,
+                            cx,
+                        )
+                    })
+            })
+        })
+        .await
+        .1;
+    scenarios.retain(|(kind, _)| {
+        matches!(kind, TaskSourceKind::Worktree { id, .. } if *id == worktree_id)
+    });
+    scenarios.sort_by(|(_, left), (_, right)| left.label.cmp(&right.label));
+
+    let mut spawn_errors = Vec::new();
+    for (_, task) in &tasks {
+        if let Err(error) = run_terminal_task(project, prepare_like_task_picker(&task.resolved), cx)
+            .await
+        {
+            spawn_errors.push(format!("{}: {error:#}", task.resolved_label));
+        }
+    }
+    for (_, scenario) in &scenarios {
+        spawn_errors.extend(run_debug_scenario(project, worktree_id, scenario, cx).await);
+    }
+
+    ExercisedCommands {
+        task_labels: tasks
+            .into_iter()
+            .map(|(_, task)| task.resolved_label)
+            .collect(),
+        scenario_labels: scenarios
+            .into_iter()
+            .map(|(_, scenario)| scenario.label.to_string())
+            .collect(),
+        spawn_errors,
+    }
+}
+
+/// The task picker calls `prepare_task_for_spawn` before `create_terminal_task`.
+/// That helper lives in `terminal_view`, which this crate does not depend on;
+/// `ShellBuilder::build_no_quote` is the function it calls.
+fn prepare_like_task_picker(task: &SpawnInTerminal) -> SpawnInTerminal {
+    let builder = ShellBuilder::new(&task.shell, false);
+    let command_label = builder.command_label(task.command.as_deref().unwrap_or(""));
+    let (command, args) = builder.build_no_quote(task.command.clone(), &task.args);
+    SpawnInTerminal {
+        command_label,
+        command: Some(command),
+        args,
+        ..task.clone()
+    }
+}
+
+/// Debug build tasks are wrapped with `ShellBuilder::build` before the same
+/// terminal spawn used for tasks.
+fn prepare_like_debug_build(task: &SpawnInTerminal) -> SpawnInTerminal {
+    let builder = ShellBuilder::new(&task.shell, false);
+    let command_label = builder.command_label(task.command.as_deref().unwrap_or(""));
+    let (command, args) = builder.build(task.command.clone(), &task.args);
+    SpawnInTerminal {
+        command_label,
+        command: Some(command),
+        args,
+        ..task.clone()
+    }
+}
+
+/// `node-terminal` configurations are split by `ShellKind::Posix` and launched
+/// as `runtimeExecutable` plus `runtimeArgs`. The JavaScript adapter then asks
+/// Zed to run that program in a terminal, and Zed uses the first argument as
+/// the program.
+fn spawn_for_node_terminal(scenario: &DebugScenario) -> Option<SpawnInTerminal> {
+    let config = scenario.config.as_object()?;
+    if config.get("type").and_then(|value| value.as_str()) != Some("node-terminal") {
+        return None;
+    }
+    let command = config.get("command")?.as_str()?;
+    let mut parts = ShellKind::Posix.split(command)?;
+    let program = parts.first()?.clone();
+    parts.remove(0);
+    Some(SpawnInTerminal {
+        id: TaskId(format!("node-terminal-{}", scenario.label)),
+        full_label: scenario.label.to_string(),
+        label: scenario.label.to_string(),
+        command: Some(program),
+        args: parts,
+        command_label: command.to_string(),
+        ..SpawnInTerminal::default()
+    })
+}
+
+async fn run_debug_scenario(
+    project: &Entity<Project>,
+    worktree_id: worktree::WorktreeId,
+    scenario: &DebugScenario,
+    cx: &mut gpui::TestAppContext,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Some(build) = &scenario.build {
+        let template = match build {
+            BuildTaskDefinition::Template { task_template, .. } => Some(task_template.clone()),
+            BuildTaskDefinition::ByName(label) => project
+                .update(cx, |project, cx| {
+                    project.task_store().update(cx, |task_store, cx| {
+                        task_store
+                            .task_inventory()
+                            .cloned()
+                            .unwrap()
+                            .read(cx)
+                            .task_template_by_label(None, Some(worktree_id), label.as_ref(), cx)
+                    })
+                })
+                .await,
+        };
+        match template {
+            Some(template) => {
+                if let Some(resolved) =
+                    template.resolve_task("debug-build-task", &TaskContext::default())
+                {
+                    if let Err(error) = run_terminal_task(
+                        project,
+                        prepare_like_debug_build(&resolved.resolved),
+                        cx,
+                    )
+                    .await
+                    {
+                        errors.push(format!("{} build: {error:#}", scenario.label));
+                    }
+                } else {
+                    errors.push(format!("{} build did not resolve", scenario.label));
+                }
+            }
+            None => errors.push(format!(
+                "{} build task was named but not registered",
+                scenario.label
+            )),
+        }
+    }
+    if let Some(spawn) = spawn_for_node_terminal(scenario) {
+        if let Err(error) = run_terminal_task(project, spawn, cx).await {
+            errors.push(format!("{}: {error:#}", scenario.label));
+        }
+    }
+    errors
+}
+
+async fn run_terminal_task(
+    project: &Entity<Project>,
+    mut spawn: SpawnInTerminal,
+    cx: &mut gpui::TestAppContext,
+) -> anyhow::Result<()> {
+    // Project roots in these tests live on FakeFs. A real shell cannot use that
+    // path as its working directory, so pin the spawn at a directory that exists.
+    if spawn.cwd.is_none() {
+        spawn.cwd = Some(env::temp_dir());
+    }
+    let terminal = project
+        .update(cx, |project, cx| project.create_terminal_task(spawn, cx))
+        .await?;
+    let status = terminal
+        .read_with(cx, |terminal, cx| terminal.wait_for_completed_task(cx))
+        .await;
+    drop(terminal);
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => anyhow::bail!("command exited with {status}"),
+        None => anyhow::bail!("command did not report an exit status"),
+    }
 }
 
 #[gpui::test]
