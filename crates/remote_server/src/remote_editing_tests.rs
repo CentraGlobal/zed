@@ -45,7 +45,7 @@ use project::{
     search::{SearchQuery, SearchResult},
 };
 use remote::RemoteClient;
-use rpc::proto;
+use rpc::proto::{self, EnvelopedMessage};
 use serde_json::json;
 use settings::{Settings, SettingsLocation, SettingsStore, initial_server_settings_content};
 use smol::stream::StreamExt;
@@ -4313,6 +4313,325 @@ async fn test_remote_trash_restore(cx: &mut TestAppContext, server_cx: &mut Test
     worktree.update(cx, |worktree, _cx| {
         assert!(worktree.entry_for_path(rel_path("file_a.txt")).is_some());
     });
+}
+
+#[gpui::test]
+async fn test_remote_server_update_user_settings_does_not_replace_local_settings_or_spawn(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree(
+            path!("/code"),
+            json!({
+                "project1": {
+                    "README.md": "# project 1"
+                },
+            }),
+        )
+        .await;
+
+    let local_fs = FakeFs::new(cx.executor());
+    let settings_path = paths::settings_file();
+    let settings_on_disk = "{\n  \"auto_update\": false\n}\n";
+    local_fs
+        .save(
+            settings_path.as_path(),
+            &settings_on_disk.into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let (project, headless) =
+        connect_remote_project(&server_fs, &local_fs, true, cx, server_cx).await;
+
+    let benign_settings = r#"{"auto_update": false}"#;
+    cx.update_global(|settings_store: &mut SettingsStore, cx| {
+        settings_store
+            .set_user_settings(benign_settings, cx)
+            .unwrap();
+    });
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+
+    server_cx.read(|cx| {
+        let user_settings = cx
+            .global::<SettingsStore>()
+            .raw_user_settings()
+            .expect("headless server should accept client user settings");
+        assert_eq!(
+            user_settings.content.auto_update,
+            Some(false),
+            "client to server UpdateUserSettings is the direction the headless server applies"
+        );
+        assert!(
+            user_settings.content.project.context_servers.is_empty(),
+            "server user settings should not contain context servers yet"
+        );
+    });
+
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let trusted = cx
+        .read(|cx| project::trusted_worktrees::TrustedWorktrees::try_get_global(cx))
+        .expect("worktree trust is tracked for this remote project");
+    let worktree_is_trusted = trusted.update(cx, |store, cx| {
+        store.can_trust(&worktree_store, worktree_id, cx)
+    });
+    assert!(
+        !worktree_is_trusted,
+        "the remote worktree must stay untrusted for this test"
+    );
+
+    let marker_directory =
+        std::env::temp_dir().join(format!("zed-update-user-settings-{}", std::process::id()));
+    std::fs::create_dir_all(&marker_directory).unwrap();
+    let _remove_markers = RemoveOnDrop(marker_directory.clone());
+    let default_marker = marker_directory.join("default");
+    let explicit_marker = marker_directory.join("explicit-local");
+    let _ = std::fs::remove_file(&default_marker);
+    let _ = std::fs::remove_file(&explicit_marker);
+
+    let attack_contents = serde_json::json!({
+        "auto_update": true,
+        "context_servers": {
+            "attacker-default": {
+                "command": "/usr/bin/touch",
+                "args": [default_marker]
+            },
+            "attacker-explicit-local": {
+                "command": "/usr/bin/touch",
+                "args": [explicit_marker],
+                "remote": false
+            }
+        }
+    })
+    .to_string();
+    let attack = round_trip_update_user_settings(proto::UpdateUserSettings {
+        project_id: proto::REMOTE_SERVER_PROJECT_ID,
+        contents: attack_contents,
+    })
+    .await;
+
+    headless.update(server_cx, |headless, _| {
+        headless
+            .session
+            .send(attack)
+            .expect("server session should accept an outgoing message");
+    });
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+
+    let client_context_servers = cx.read(|cx| {
+        let user_settings = cx.global::<SettingsStore>().raw_user_settings().unwrap();
+        (
+            user_settings.content.auto_update,
+            user_settings
+                .content
+                .project
+                .context_servers
+                .keys()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+        )
+    });
+    let server_context_servers = server_cx.read(|cx| {
+        let user_settings = cx.global::<SettingsStore>().raw_user_settings().unwrap();
+        (
+            user_settings.content.auto_update,
+            user_settings
+                .content
+                .project
+                .context_servers
+                .keys()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+        )
+    });
+    let configured_servers = project.read_with(cx, |project, cx| {
+        project
+            .context_server_store()
+            .read(cx)
+            .configured_server_ids()
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+    });
+    let settings_file_after = local_fs.load(settings_path.as_path()).await.unwrap();
+    let default_marker_exists = default_marker.exists();
+    let explicit_marker_exists = explicit_marker.exists();
+
+    assert_eq!(
+        settings_file_after, settings_on_disk,
+        "UpdateUserSettings from the remote server must not write the local settings file"
+    );
+    assert_eq!(
+        client_context_servers.0,
+        Some(false),
+        "remote UpdateUserSettings replaced local user settings: context servers {configured_servers:?}, client context servers {:?}, server context servers {:?}, marker_default={default_marker_exists}, marker_explicit={explicit_marker_exists}",
+        client_context_servers.1,
+        server_context_servers.1,
+    );
+    assert!(
+        client_context_servers.1.is_empty(),
+        "remote UpdateUserSettings installed context servers into local user settings: {:?}",
+        client_context_servers.1
+    );
+    assert_eq!(
+        server_context_servers.0,
+        Some(false),
+        "applying the remote message echoed attacker settings back onto the headless server"
+    );
+    assert!(
+        server_context_servers.1.is_empty(),
+        "headless server user settings now contain the attacker's context servers: {:?}",
+        server_context_servers.1
+    );
+    assert!(
+        !configured_servers
+            .iter()
+            .any(|id| id == "attacker-default" || id == "attacker-explicit-local"),
+        "local context server store started servers from the remote message: {configured_servers:?}"
+    );
+    assert!(
+        !default_marker_exists,
+        "default remote=false context server command ran locally and created {default_marker:?}"
+    );
+    assert!(
+        !explicit_marker_exists,
+        "explicit remote=false context server command ran locally and created {explicit_marker:?}"
+    );
+
+    cx.update_global(|settings_store: &mut SettingsStore, cx| {
+        settings_store
+            .set_user_settings(r#"{"auto_update": false, "helix_mode": true}"#, cx)
+            .unwrap();
+    });
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    server_cx.read(|cx| {
+        let user_settings = cx.global::<SettingsStore>().raw_user_settings().unwrap();
+        assert_eq!(user_settings.content.helix_mode, Some(true));
+        assert!(user_settings.content.project.context_servers.is_empty());
+    });
+}
+
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn round_trip_update_user_settings(
+    message: proto::UpdateUserSettings,
+) -> proto::UpdateUserSettings {
+    let mut cursor = futures::io::Cursor::new(Vec::new());
+    let mut buffer = Vec::new();
+    remote::protocol::write_message(
+        &mut cursor,
+        &mut buffer,
+        message.into_envelope(1, None, None),
+    )
+    .await
+    .unwrap();
+    cursor.set_position(0);
+    let decoded = remote::protocol::read_message(&mut cursor, &mut buffer)
+        .await
+        .unwrap();
+    proto::UpdateUserSettings::from_envelope(decoded).unwrap()
+}
+
+async fn connect_remote_project(
+    server_fs: &Arc<FakeFs>,
+    local_fs: &Arc<FakeFs>,
+    init_worktree_trust: bool,
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) -> (Entity<Project>, Entity<HeadlessProject>) {
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    server_cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    init_logger();
+
+    let (opts, ssh_server_client, _) = RemoteClient::fake_server(cx, server_cx);
+    let http_client = Arc::new(BlockedHttpClient);
+    let node_runtime = NodeRuntime::unavailable();
+    let languages = Arc::new(LanguageRegistry::new(cx.executor()));
+    let proxy = Arc::new(ExtensionHostProxy::new());
+    server_cx.update(HeadlessProject::init);
+    let headless = server_cx.new(|cx| {
+        HeadlessProject::new(
+            crate::HeadlessAppState {
+                session: ssh_server_client,
+                fs: server_fs.clone(),
+                http_client,
+                node_runtime,
+                languages,
+                extension_host_proxy: proxy,
+                startup_time: std::time::Instant::now(),
+            },
+            false,
+            cx,
+        )
+    });
+
+    let ssh = RemoteClient::connect_mock(opts, cx).await;
+    cx.update(|cx| {
+        if !cx.has_global::<SettingsStore>() {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        }
+        project::trusted_worktrees::init(collections::HashMap::default(), cx);
+    });
+    let client = cx.update(|cx| {
+        Client::new(
+            Arc::new(FakeSystemClock::new()),
+            FakeHttpClient::with_404_response(),
+            cx,
+        )
+    });
+    let languages = Arc::new(LanguageRegistry::test(cx.executor()));
+    let project = cx.update(|cx| {
+        let node = NodeRuntime::unavailable();
+        let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+        Project::init(&client, cx);
+        Project::remote(
+            ssh,
+            client,
+            node,
+            user_store,
+            languages,
+            local_fs.clone(),
+            init_worktree_trust,
+            cx,
+        )
+    });
+    project
+        .update(cx, {
+            let headless = headless.clone();
+            |_, cx| cx.on_release(|_, _| drop(headless))
+        })
+        .detach();
+    (project, headless)
 }
 
 pub async fn init_test(
