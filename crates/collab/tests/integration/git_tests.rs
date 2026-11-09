@@ -9,7 +9,8 @@ use collections::HashMap;
 use git::{
     Oid,
     repository::{
-        CommitData, GitCommitTemplate, InitialGraphCommitData, RepoPath, Worktree as GitWorktree,
+        CommitData, CreateWorktreeTarget, GitCommitTemplate, InitialGraphCommitData, RepoPath,
+        Worktree as GitWorktree,
     },
     status::{DiffStat, FileStatus, StatusCode, TrackedStatus},
 };
@@ -592,6 +593,137 @@ async fn test_remote_git_worktrees(
         worktrees.len(),
         3,
         "Worktree count should be unchanged after failed removal"
+    );
+}
+
+#[gpui::test]
+async fn test_write_collaborator_cannot_create_worktree_outside_shared_project(
+    executor: BackgroundExecutor,
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    client_a
+        .fs()
+        .insert_tree(
+            path!("/project"),
+            json!({ ".git": {}, "payload.txt": "payload-marker\n" }),
+        )
+        .await;
+    client_a.fs().insert_branches(
+        Path::new(path!("/project/.git")),
+        &["main", "existing-branch"],
+    );
+
+    let (project_a, _) = client_a.build_local_project(path!("/project"), cx_a).await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+    executor.run_until_parked();
+
+    let repo_b = cx_b.update(|cx| project_b.read(cx).active_repository(cx).unwrap());
+
+    let cases = [
+        (
+            CreateWorktreeTarget::NewBranch {
+                branch_name: "escape-new".to_string(),
+                base_sha: None,
+            },
+            PathBuf::from(path!("/guest-escape-new/nested/checkout")),
+            PathBuf::from(path!("/guest-escape-new")),
+        ),
+        (
+            CreateWorktreeTarget::ExistingBranch {
+                branch_name: "existing-branch".to_string(),
+            },
+            PathBuf::from(path!("/guest-escape-existing/nested/checkout")),
+            PathBuf::from(path!("/guest-escape-existing")),
+        ),
+        (
+            CreateWorktreeTarget::Detached { base_sha: None },
+            PathBuf::from(path!("/guest-escape-detached/nested/checkout")),
+            PathBuf::from(path!("/guest-escape-detached")),
+        ),
+    ];
+
+    for (target, directory, escaped_root) in cases {
+        let result = cx_b
+            .update(|cx| {
+                repo_b.update(cx, |repository, _| {
+                    repository.create_worktree(target, directory)
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "write collaborator created a worktree at {}",
+            escaped_root.display()
+        );
+        let metadata = client_a.fs().metadata(&escaped_root).await.unwrap();
+        assert!(
+            metadata.is_none(),
+            "rejected GitCreateWorktree still created {}",
+            escaped_root.display()
+        );
+    }
+}
+
+#[gpui::test]
+async fn test_write_collaborator_cannot_git_init_outside_shared_project(
+    executor: BackgroundExecutor,
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    client_a
+        .fs()
+        .insert_tree(path!("/project"), json!({ ".git": {}, "file.txt": "" }))
+        .await;
+
+    let (project_a, _) = client_a.build_local_project(path!("/project"), cx_a).await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a, cx))
+        .await
+        .unwrap();
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+    executor.run_until_parked();
+
+    let git_store = cx_b.update(|cx| project_b.read(cx).git_store().clone());
+    let outside = PathBuf::from(path!("/guest-init-outside"));
+    let result = cx_b
+        .update(|cx| {
+            git_store.update(cx, |store, cx| {
+                store.git_init(outside.clone().into(), "main".into(), cx)
+            })
+        })
+        .await;
+    assert!(
+        result.is_err(),
+        "write collaborator initialized a repository at {}",
+        outside.display()
+    );
+    let metadata = client_a.fs().metadata(&outside).await.unwrap();
+    assert!(
+        metadata.is_none(),
+        "rejected GitInit still created {}",
+        outside.display()
     );
 }
 
